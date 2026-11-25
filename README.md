@@ -1,18 +1,18 @@
 # Adblocker
 A locally hosted DNS adblocker on the local network
 
-# C commands
+## C commands
 Run these in powershell in the Adblocker folder
-## Compile
+### Compile
 gcc -Wall -Wextra -g3 main.c adblocker.c -o output\adblocker.exe -lws2_32 
-## Run 
+### Run 
 .\output\adblocker.exe   
 
-# Make trafic run through adblocker
+## Make trafic run through adblocker
 Run this in any powershell terminal
-## Start
+### Start
 Set-DnsClientServerAddress -InterfaceAlias "WiFi 2" -ServerAddresses 127.0.0.1
 ipconfig /flushdns
-## Stop
+### Stop
 Set-DnsClientServerAddress -InterfaceAlias "WiFi 2" -ResetServerAddresses
 ipconfig /flushdns
