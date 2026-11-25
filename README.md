@@ -11,7 +11,7 @@ gcc -Wall -Wextra -g3 main.c adblocker.c -o output\adblocker.exe -lws2_32
 # Make trafic run through adblocker
 Run this in any powershell terminal
 ## Start
-PS C:\Windows\system32> Set-DnsClientServerAddress -InterfaceAlias "WiFi 2" -ServerAddresses 127.0.0.1
+Set-DnsClientServerAddress -InterfaceAlias "WiFi 2" -ServerAddresses 127.0.0.1
 ipconfig /flushdns
 ## Stop
 Set-DnsClientServerAddress -InterfaceAlias "WiFi 2" -ResetServerAddresses
