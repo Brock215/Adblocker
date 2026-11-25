@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MAX_BLOCKED 1000 //Most domains to hold
+#define MAX_DOMAIN 256 //Longest domain to store
+
+static char blocklist[MAX_BLOCKED][MAX_DOMAIN]; //The blocked domains
+static int blocklist_count = 0; //How many are loaded so far
+
 SOCKET create_listener_socket(const char *port){
     struct addrinfo socket_settings; //settings for the socket we want
     struct addrinfo *results, *curr_addr; //result list and current item in loop request
@@ -86,11 +92,15 @@ void receive(SOCKET listener_socket, char *buffer, int buffer_size){
             printf("malformed packet\n");
             continue;
         }
-        printf("question: %s type=%u qend=%d\n", name, qtype, qend);
-        int reply_len = build_reply((const unsigned char *)buffer, qend, qtype, reply);
-        if (sendto(listener_socket, (const char *)reply, reply_len, 0,
-            (struct sockaddr *)&client_addr, addr_len) == SOCKET_ERROR) {
+        if (is_blocked(name)) {
+            printf("BLOCKED\n");
+            int reply_len = build_reply((const unsigned char *)buffer, qend, qtype, reply);
+            if (sendto(listener_socket, (const char *)reply, reply_len, 0,
+                    (struct sockaddr *)&client_addr, addr_len) == SOCKET_ERROR) {
                 printf("sendto failed: %d\n", WSAGetLastError());
+            }
+        } else {
+            printf("allowed \n"); 
         }
     }
 }
@@ -140,9 +150,9 @@ int build_reply(const unsigned char *query, int qend, unsigned short qtype, unsi
         0x00, 0x00, 0x00, 0x00  //the address, 0.0.0.0.
     };
 
-    memcpy(reply, query, qend); //Copy the header and question, this keeps the transaction ID
-    reply[2] = 0x80 | (query[2] & 0x79); // keep the opcode and RD bits from the query
-    reply[3] = 0x80; //RA=1 recursion, RCODE=0 .
+    memcpy(reply, query, qend); 
+    reply[2] = 0x80 | (query[2] & 0x79); 
+    reply[3] = 0x80; 
     memset(reply + 6, 0, 6); //Zero ANCOUNT, NSCOUNT and ARCOUNT, so we don't claim records that aren't there
 
     int len = qend; //Reply length so far.
@@ -153,5 +163,70 @@ int build_reply(const unsigned char *query, int qend, unsigned short qtype, unsi
         len += sizeof answer;
     }
 
-    return len; //Total bytes to send.
+    return len; //Total bytes to send
+}
+
+int read_blocklist(const char *path){
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1; //Couldn't open the file.
+
+    char line[512];
+    while (fgets(line, sizeof line, f) != NULL) {
+        //No newline and not at the end of the file means the line was too long for the buffer, so skip the rest of it.
+        if (strchr(line, '\n') == NULL && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != '\n' && c != EOF) {}
+            continue;
+        }
+
+        char *hash = strchr(line, '#'); //Cut off any comment.
+        if (hash != NULL) *hash = '\0';
+
+        size_t len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len - 1])) { //Strip trailing spaces, '\n' and '\r'.
+            line[--len] = '\0';
+        }
+        if (len > 0 && line[len - 1] == '.') line[--len] = '\0'; //Strip a trailing dot, "example.com." is the same name.
+
+        char *start = line;
+        while (*start != '\0' && isspace((unsigned char)*start)) start++; //Skip leading whitespace.
+
+        if (*start == '\0') continue; //Empty line or comment only.
+        if (strlen(start) >= MAX_DOMAIN) continue; //Too long to store, skip it.
+        if (blocklist_count >= MAX_BLOCKED) { //List is full, stop loading.
+            printf("blocklist full, ignoring the rest\n");
+            break;
+        }
+
+        for (char *p = start; *p != '\0'; p++) { //DNS names are case-insensitive, store lowercase.
+            *p = (char)tolower((unsigned char)*p);
+        }
+
+        strcpy(blocklist[blocklist_count], start); //Safe, we checked the length above.
+        blocklist_count++;
+    }
+
+    fclose(f);
+    return blocklist_count; //How many domains were loaded.
+}
+
+int is_blocked(const char *name){
+    char lower[MAX_DOMAIN]; //A lowercase copy, so we don't change the caller's string
+    if (strlen(name) >= sizeof lower) return 0; //Too long to be in our list anyway
+
+    for (size_t i = 0; name[i] != '\0'; i++) { //DNS names are case-insensitive, compare in lowercase
+        lower[i] = (char)tolower((unsigned char)name[i]);
+        lower[i + 1] = '\0';
+    }
+    if (name[0] == '\0') lower[0] = '\0'; //Handle an empty name
+
+    const char *p = lower; //Start with the full name, "ads.doubleclick.net"
+    while (p != NULL) {
+        for (int i = 0; i < blocklist_count; i++) {
+            if (strcmp(blocklist[i], p) == 0) return 1; //Exact match on this part of the name
+        }
+        p = strchr(p, '.'); //Jump to the next dot
+        if (p != NULL) p++; // Skip it
+    }
+    return 0; 
 }

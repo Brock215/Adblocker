@@ -11,5 +11,8 @@ int parse_question(const unsigned char *pkt, int len, char *name, size_t name_ca
                    unsigned short *qtype, int *qend);
 
 int build_reply(const unsigned char *query, int qend, unsigned short qtype, unsigned char *reply);
-
+// Read a file of blocked domains into memory
+int read_blocklist(const char *path);
+// Check if a domain name is in the blocklist 
+int is_blocked(const char *name)
 #endif
