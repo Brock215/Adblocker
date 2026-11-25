@@ -5,11 +5,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_BLOCKED 1000 //Most domains to hold
 #define MAX_DOMAIN 256 //Longest domain to store
+#define TABLE_SIZE 262144 //Number of buckets, a power of two so we can use & instead of %.
 
-static char blocklist[MAX_BLOCKED][MAX_DOMAIN]; //The blocked domains
+typedef struct entry { //One blocked domain in a bucket's linked list.
+    char *domain;
+    struct entry *next;
+} entry_t;
+
+static struct sockaddr_in upstream_addr; //Address of the real DNS server we forward to
+static entry_t *table[TABLE_SIZE]; //Each slot starts a list of the domains that hashed to it.
 static int blocklist_count = 0; //How many are loaded so far
+
+
 
 SOCKET create_listener_socket(const char *port){
     struct addrinfo socket_settings; //settings for the socket we want
@@ -68,10 +76,11 @@ SOCKET create_listener_socket(const char *port){
     return listener_socket;
 }
 
-void receive(SOCKET listener_socket, char *buffer, int buffer_size){
+void receive(SOCKET listener_socket, SOCKET upstream_socket, char *buffer, int buffer_size){
     struct sockaddr_in client_addr; //Holds the address of the client that sent the data
     char ipstr[INET_ADDRSTRLEN];    //Holds the client's IP as text
     unsigned char reply[4096 + 16]; //Room for a full-size query plus the 16 byte answer
+    char response[4096]; //Holds the upstream server's answer.
 
     while (1)
     {
@@ -100,7 +109,16 @@ void receive(SOCKET listener_socket, char *buffer, int buffer_size){
                 printf("sendto failed: %d\n", WSAGetLastError());
             }
         } else {
-            printf("allowed \n"); 
+            int rn = forward_query(upstream_socket, buffer, n, response, sizeof response);
+            if (rn < 0) {
+                printf("allowed, but upstream failed\n");
+                continue;
+            }
+            printf("allowed (forwarded, %d byte reply)\n", rn);
+            if (sendto(listener_socket, response, rn, 0,
+                    (struct sockaddr *)&client_addr, addr_len) == SOCKET_ERROR) {
+                printf("sendto failed: %d\n", WSAGetLastError());
+            }
         }
     }
 }
@@ -188,45 +206,103 @@ int read_blocklist(const char *path){
         }
         if (len > 0 && line[len - 1] == '.') line[--len] = '\0'; //Strip a trailing dot, "example.com." is the same name.
 
-        char *start = line;
-        while (*start != '\0' && isspace((unsigned char)*start)) start++; //Skip leading whitespace.
+        char *start = line + len; //Hosts lines look like "0.0.0.0 domain", so take the last word on the line.
+        while (start > line && !isspace((unsigned char)start[-1])) start--;
 
         if (*start == '\0') continue; //Empty line or comment only.
-        if (strlen(start) >= MAX_DOMAIN) continue; //Too long to store, skip it.
-        if (blocklist_count >= MAX_BLOCKED) { //List is full, stop loading.
-            printf("blocklist full, ignoring the rest\n");
-            break;
-        }
+        if (strchr(start, '.') == NULL) continue; //No dot means "localhost", "broadcasthost" and so on.
+        if (strcmp(start, "0.0.0.0") == 0) continue; //The list has a "0.0.0.0 0.0.0.0" line.
+        if (strlen(start) >= MAX_DOMAIN) continue; //Too long to be a real domain.
 
         for (char *p = start; *p != '\0'; p++) { //DNS names are case-insensitive, store lowercase.
             *p = (char)tolower((unsigned char)*p);
         }
 
-        strcpy(blocklist[blocklist_count], start); //Safe, we checked the length above.
-        blocklist_count++;
+        table_add(start); //Adds it to the hash table, duplicates are ignored.
     }
 
     fclose(f);
-    return blocklist_count; //How many domains were loaded.
+    return blocklist_count; //Running total across every file loaded so far.
 }
 
+
 int is_blocked(const char *name){
-    char lower[MAX_DOMAIN]; //A lowercase copy, so we don't change the caller's string
-    if (strlen(name) >= sizeof lower) return 0; //Too long to be in our list anyway
+    char lower[MAX_DOMAIN]; //A lowercase copy, so we don't change the caller's string.
+    size_t len = strlen(name);
+    if (len >= sizeof lower) return 0; //Too long to be in our list anyway.
 
-    for (size_t i = 0; name[i] != '\0'; i++) { //DNS names are case-insensitive, compare in lowercase
+    for (size_t i = 0; i < len; i++) { //DNS names are case-insensitive, compare in lowercase.
         lower[i] = (char)tolower((unsigned char)name[i]);
-        lower[i + 1] = '\0';
     }
-    if (name[0] == '\0') lower[0] = '\0'; //Handle an empty name
+    lower[len] = '\0';
 
-    const char *p = lower; //Start with the full name, "ads.doubleclick.net"
+    const char *p = lower; //Start with the full name, "ads.doubleclick.net".
     while (p != NULL) {
-        for (int i = 0; i < blocklist_count; i++) {
-            if (strcmp(blocklist[i], p) == 0) return 1; //Exact match on this part of the name
-        }
-        p = strchr(p, '.'); //Jump to the next dot
-        if (p != NULL) p++; // Skip it
+        if (table_contains(p)) return 1; //Exact match on this part of the name.
+        p = strchr(p, '.'); //Jump to the next dot...
+        if (p != NULL) p++; //...and step past it, giving "doubleclick.net", then "net".
     }
-    return 0; 
+    return 0; //No part of the name was on the list.
+}
+
+unsigned int hash_str(const char *s){ //djb2, a simple string hash.
+    unsigned int h = 5381;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h & (TABLE_SIZE - 1); //Keep the result inside the table.
+}
+
+int table_contains(const char *domain){
+    for (entry_t *e = table[hash_str(domain)]; e != NULL; e = e->next) {
+        if (strcmp(e->domain, domain) == 0) return 1;
+    }
+    return 0;
+}
+
+void table_add(const char *domain){
+    if (table_contains(domain)) return; //Lists often repeat domains.
+    entry_t *e = malloc(sizeof *e);
+    char *copy = strdup(domain);
+    if (e == NULL || copy == NULL) { printf("out of memory\n"); exit(1); }
+    unsigned int h = hash_str(domain);
+    e->domain = copy;
+    e->next = table[h]; //Insert at the front of this bucket's list.
+    table[h] = e;
+    blocklist_count++;
+}
+
+SOCKET create_upstream_socket(void){
+    SOCKET up = socket(AF_INET, SOCK_DGRAM, 0);
+    if (up == INVALID_SOCKET) {
+        printf("socket failed: %d\n", WSAGetLastError());
+
+        return INVALID_SOCKET;
+    }
+
+    memset(&upstream_addr, 0, sizeof upstream_addr);
+    upstream_addr.sin_family = AF_INET;
+    upstream_addr.sin_port = htons(53);
+    inet_pton(AF_INET, "1.1.1.1", &upstream_addr.sin_addr);
+
+    DWORD timeout = 3000; //On Windows this option takes milliseconds as a DWORD, not a timeval.
+    if (setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout) == SOCKET_ERROR) {
+        printf("setsockopt failed: %d\n", WSAGetLastError());
+        closesocket(up);
+        return INVALID_SOCKET;
+    }
+    return up;
+}
+
+int forward_query(SOCKET up, const char *query, int qlen, char *response, int response_cap){
+    if (sendto(up, query, qlen, 0, (struct sockaddr *)&upstream_addr, sizeof upstream_addr) == SOCKET_ERROR) {
+        return -1; //Couldn't send.
+    }
+
+    while (1) {
+        int n = recvfrom(up, response, response_cap, 0, NULL, NULL);
+        if (n == SOCKET_ERROR) return -1; //Timed out or failed.
+
+        //Only accept a reply whose transaction ID matches our query.
+        if (n >= 2 && response[0] == query[0] && response[1] == query[1]) return n;
+        //Otherwise it's a late reply to an older query, ignore it and keep waiting.
+    }
 }

@@ -5,7 +5,7 @@
 
 SOCKET create_listener_socket(const char *port);
 
-void receive(SOCKET listener_socket, char *buffer, int buffer_size);
+void receive(SOCKET listener_socket, SOCKET upstream_socket, char *buffer, int buffer_size);
 //Parse a DNS question from a packet. Returns 0 on success, -1 on failure.
 int parse_question(const unsigned char *pkt, int len, char *name, size_t name_cap,
                    unsigned short *qtype, int *qend);
@@ -14,5 +14,10 @@ int build_reply(const unsigned char *query, int qend, unsigned short qtype, unsi
 // Read a file of blocked domains into memory
 int read_blocklist(const char *path);
 // Check if a domain name is in the blocklist 
-int is_blocked(const char *name)
+int is_blocked(const char *name);
+SOCKET create_upstream_socket(void);
+int forward_query(SOCKET up, const char *query, int qlen, char *response, int response_cap);
+void table_add(const char *domain);
+int table_contains(const char *domain);
+unsigned int hash_str(const char *s);
 #endif
